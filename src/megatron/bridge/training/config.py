@@ -38,7 +38,7 @@ from megatron.training.config import DistributedInitConfig as MTrainDistributedI
 from megatron.training.config import LoggerConfig as MTrainLoggerConfig
 from megatron.training.config import ProfilingConfig as MTrainProfilingConfig
 from megatron.training.config import RerunStateMachineConfig as MTrainRerunStateMachineConfig
-from megatron.training.config import RNGConfig, ValidationConfig
+from megatron.training.config import RNGConfig, ValidationConfig as MTrainValidationConfig
 from megatron.training.config import SchedulerConfig as MTrainSchedulerConfig
 from megatron.training.config import StragglerDetectionConfig as MTrainStragglerDetectionConfig
 from megatron.training.config import TrainingConfig as MTrainTrainingConfig
@@ -452,6 +452,59 @@ class GPTFIMDatasetConfig(GPTDatasetConfig):
         self.fim_no_prefix = fim_no_prefix
 
         super().__init__(**kwargs)
+
+
+@dataclass(kw_only=True)
+class DownstreamValidationDatasetConfig:
+    """Configuration for an additional validation-only dataset.
+
+    These datasets are evaluated at the normal validation interval and never used
+    for training. They are intended for coarse-grained domains or downstream
+    buckets such as code, math, and general knowledge.
+    """
+
+    name: str
+    """Stable metric namespace, e.g. ``code`` or ``math``."""
+
+    dataset: GPTDatasetConfig | DatasetProvider | None = None
+    """Optional complete dataset config for this validation task."""
+
+    data_path: str | list[str] | None = None
+    """Optional GPT idx/bin prefix list for this validation task.
+
+    When set, the framework clones the main GPT dataset config and replaces its
+    validation split with this path list.
+    """
+
+    data_args_path: str | None = None
+    """Optional file containing the GPT idx/bin path list for this validation task."""
+
+    eval_iters: int | None = None
+    """Optional per-task evaluation iterations. Defaults to validation.eval_iters."""
+
+    def validate(self) -> None:
+        """Validate task-level configuration."""
+        if not self.name:
+            raise ValueError("Downstream validation dataset name must be non-empty.")
+        if self.dataset is not None and (self.data_path is not None or self.data_args_path is not None):
+            raise ValueError(
+                f"Downstream validation dataset '{self.name}' must set either dataset or "
+                "data_path/data_args_path, not both."
+            )
+        if self.dataset is None and self.data_path is None and self.data_args_path is None:
+            raise ValueError(
+                f"Downstream validation dataset '{self.name}' must set dataset, data_path, or data_args_path."
+            )
+        if self.eval_iters is not None and self.eval_iters < 0:
+            raise ValueError(f"Downstream validation dataset '{self.name}' eval_iters must be >= 0.")
+
+
+@dataclass(kw_only=True)
+class ValidationConfig(MTrainValidationConfig):
+    """Bridge validation config with optional task-level validation datasets."""
+
+    downstream_validation_datasets: list[DownstreamValidationDatasetConfig] = field(default_factory=list)
+    """Additional validation-only datasets evaluated at every validation phase."""
 
 
 @dataclass
@@ -1152,6 +1205,9 @@ class ConfigContainer(Container):
             self.nvrx_straggler.finalize()
         if self.tensor_inspect is not None:
             self.tensor_inspect.finalize()
+        if hasattr(self.validation, "finalize"):
+            self.validation.finalize()
+        self._validate_downstream_validation_datasets()
 
         # Sync config. If TE RNG tracker is set in either ways, set them in both places.
         if self.rng.te_rng_tracker or self.model.use_te_rng_tracker:
@@ -1344,6 +1400,15 @@ class ConfigContainer(Container):
                     stacklevel=2,
                 )
                 setattr(self.validation, f.name, train_val)
+
+    def _validate_downstream_validation_datasets(self) -> None:
+        """Validate task-level validation dataset configuration."""
+        seen_names = set()
+        for downstream_dataset in self.validation.downstream_validation_datasets:
+            downstream_dataset.validate()
+            if downstream_dataset.name in seen_names:
+                raise ValueError(f"Duplicate downstream validation dataset name: {downstream_dataset.name}")
+            seen_names.add(downstream_dataset.name)
 
     def _validate_cp_comm_type(self) -> None:
         """Validate cp_comm_type and hierarchical_context_parallel_sizes consistency."""

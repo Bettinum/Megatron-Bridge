@@ -380,6 +380,7 @@ def evaluate_and_print_results(
     pg_collection: Optional[Union[ProcessGroupCollection, "MultiModuleProcessGroupCollection"]] = None,
     callback_manager: CallbackManager | None = None,
     is_test: bool = False,
+    metric_label: str = "validation",
 ) -> None:
     """Helper function to evaluate and dump results on screen.
 
@@ -401,6 +402,7 @@ def evaluate_and_print_results(
         callback_manager (Optional[CallbackManager]): Optional callback manager for firing callbacks.
         is_test (bool, optional): Whether this is test evaluation (vs validation). Defaults to False.
             Controls which callback events are fired (on_test_* vs on_eval_*).
+        metric_label (str, optional): Metric label used in console and logger names.
     """
     # Determine callback event names based on whether this is test or eval
     start_event = "on_test_start" if is_test else "on_eval_start"
@@ -443,43 +445,44 @@ def evaluate_and_print_results(
     # Timelimit hit during evaluation
     if timelimit:
         return
-    string = f" validation loss at {prefix} | "
+    string = f" {metric_label} loss at {prefix} | "
     for key in total_loss_dict:
         string += "{} value: {:.6E} | ".format(key, total_loss_dict[key].item())
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += "{} PPL: {:.6E} | ".format(key, ppl)
+        metric_name = f"{key} {metric_label}"
+        metric_name_vs_samples = f"{key} {metric_label} vs samples"
+        metric_ppl_name = f"{key} {metric_label} ppl"
+        metric_ppl_name_vs_samples = f"{key} {metric_label} ppl vs samples"
         if writer:
-            writer.add_scalar("{} validation".format(key), total_loss_dict[key].item(), state.train_state.step)
+            writer.add_scalar(metric_name, total_loss_dict[key].item(), state.train_state.step)
             writer.add_scalar(
-                "{} validation vs samples".format(key),
+                metric_name_vs_samples,
                 total_loss_dict[key].item(),
                 state.train_state.consumed_train_samples,
             )
             if state.cfg.logger.log_validation_ppl_to_tensorboard:
-                writer.add_scalar("{} validation ppl".format(key), ppl, state.train_state.step)
-                writer.add_scalar(
-                    "{} validation ppl vs samples".format(key), ppl, state.train_state.consumed_train_samples
-                )
+                writer.add_scalar(metric_ppl_name, ppl, state.train_state.step)
+                writer.add_scalar(metric_ppl_name_vs_samples, ppl, state.train_state.consumed_train_samples)
 
         if wandb_writer and is_last_rank():
-            wandb_writer.log({"{} validation".format(key): total_loss_dict[key].item()}, state.train_state.step)
+            wandb_writer.log({metric_name: total_loss_dict[key].item()}, state.train_state.step)
             if state.cfg.logger.log_validation_ppl_to_tensorboard:
-                wandb_writer.log({"{} validation ppl".format(key): ppl}, state.train_state.step)
+                wandb_writer.log({metric_ppl_name: ppl}, state.train_state.step)
 
         if mlflow_writer and is_last_rank():
             mlflow_writer.log_metrics(
-                _sanitize_mlflow_metrics({f"val/{key}": total_loss_dict[key].item()}), step=state.train_state.step
+                _sanitize_mlflow_metrics({f"{metric_label}/{key}": total_loss_dict[key].item()}),
+                step=state.train_state.step,
             )
             if state.cfg.logger.log_validation_ppl_to_tensorboard:
                 mlflow_writer.log_metrics(
-                    _sanitize_mlflow_metrics({f"val/{key} ppl": ppl}), step=state.train_state.step
+                    _sanitize_mlflow_metrics({f"{metric_label}/{key} ppl": ppl}), step=state.train_state.step
                 )
         if comet_logger and is_last_rank():
-            comet_logger.log_metrics(
-                {"{} validation".format(key): total_loss_dict[key].item()}, step=state.train_state.step
-            )
+            comet_logger.log_metrics({metric_name: total_loss_dict[key].item()}, step=state.train_state.step)
             if state.cfg.logger.log_validation_ppl_to_tensorboard:
-                comet_logger.log_metrics({"{} validation ppl".format(key): ppl}, step=state.train_state.step)
+                comet_logger.log_metrics({metric_ppl_name: ppl}, step=state.train_state.step)
 
     if process_non_loss_data_func is not None and writer and is_last_rank():
         process_non_loss_data_func(collected_non_loss_data, state.train_state.step, writer)
@@ -499,3 +502,59 @@ def evaluate_and_print_results(
                 total_loss_dict=total_loss_dict,
             ),
         )
+
+
+def evaluate_downstream_validation_tasks(
+    state: GlobalState,
+    prefix: str,
+    forward_step_func: ForwardStepCallable,
+    downstream_data_iterators: dict[str, Optional[Union[RerunDataIterator, list[RerunDataIterator]]]],
+    model: list[MegatronModule],
+    config: ConfigContainer,
+    verbose: bool = False,
+    write_to_tensorboard: bool = True,
+    process_non_loss_data_func: Optional[Callable] = None,
+    non_loss_data_func: Optional[Callable] = None,
+    p2p_communicator: Optional[Union[P2PCommunicator, "MultiModulePipelineCommunicator"]] = None,
+    pg_collection: Optional[Union[ProcessGroupCollection, "MultiModuleProcessGroupCollection"]] = None,
+    callback_manager: CallbackManager | None = None,
+) -> None:
+    """Evaluate every configured downstream validation task."""
+    if not downstream_data_iterators:
+        return
+
+    original_eval_iters = state.cfg.validation.eval_iters
+    original_consumed_valid_samples = state.train_state.consumed_valid_samples
+
+    for validation_dataset in state.cfg.validation.downstream_validation_datasets:
+        data_iterator = downstream_data_iterators.get(validation_dataset.name)
+        if data_iterator is None:
+            continue
+
+        task_eval_iters = (
+            original_eval_iters if validation_dataset.eval_iters is None else validation_dataset.eval_iters
+        )
+        if task_eval_iters is None or task_eval_iters <= 0:
+            continue
+
+        state.cfg.validation.eval_iters = task_eval_iters
+        try:
+            evaluate_and_print_results(
+                state=state,
+                prefix=f"{prefix} on {validation_dataset.name} validation set",
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                config=config,
+                verbose=verbose,
+                write_to_tensorboard=write_to_tensorboard,
+                process_non_loss_data_func=process_non_loss_data_func,
+                non_loss_data_func=non_loss_data_func,
+                p2p_communicator=p2p_communicator,
+                pg_collection=pg_collection,
+                callback_manager=callback_manager,
+                metric_label=f"validation/{validation_dataset.name}",
+            )
+        finally:
+            state.cfg.validation.eval_iters = original_eval_iters
+            state.train_state.consumed_valid_samples = original_consumed_valid_samples

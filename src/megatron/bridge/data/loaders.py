@@ -399,6 +399,78 @@ def build_train_valid_test_data_iterators(
     return train_data_iterator, valid_data_iterator, test_data_iterator
 
 
+def get_data_iterator(dataloader_type: str, dataloader):
+    """Return the iterator wrapper for a dataloader type."""
+    if dataloader_type == "single":
+        # Single-pass iteration (no cycling)
+        return RerunDataIterator(iter(dataloader))
+    elif dataloader_type in ("cyclic", "batch"):
+        # Cycle for finetuning: allows train_iters > dataset size without raising StopIteration
+        return RerunDataIterator(iter(cyclic_iter(dataloader)))
+    elif dataloader_type == "external":
+        # External dataloader is passed through. User is expected to define how to iterate.
+        if isinstance(dataloader, list):
+            return [RerunDataIterator(d) for d in dataloader]
+        else:
+            return RerunDataIterator(dataloader)
+    else:
+        raise RuntimeError("unexpected dataloader type")
+
+
+def build_validation_data_iterator(
+    cfg: ConfigContainer,
+    dataset_config,
+    build_train_valid_test_datasets_provider: Callable,
+    dp_group: torch.distributed.ProcessGroup,
+    eval_iters: Optional[int] = None,
+):
+    """Build a validation-only data iterator for an auxiliary dataset.
+
+    This is used for task-level validation datasets. It intentionally does not
+    mutate ``TrainState`` flags and does not build train/test dataloaders.
+    """
+    eval_iters = cfg.validation.eval_iters if eval_iters is None else eval_iters
+    if eval_iters is None or eval_iters <= 0:
+        return None
+
+    eval_gbs = (
+        cfg.validation.eval_global_batch_size
+        if cfg.validation.eval_global_batch_size is not None
+        else cfg.train.global_batch_size
+    )
+    eval_mbs = (
+        cfg.validation.eval_micro_batch_size
+        if cfg.validation.eval_micro_batch_size is not None
+        else cfg.train.micro_batch_size
+    )
+    valid_samples = eval_iters * eval_gbs
+
+    print_rank_0(f" > downstream validation target size: {valid_samples}")
+    _, valid_ds, _ = build_train_valid_test_datasets_provider((0, valid_samples, 0), dataset_config)
+    if valid_ds is None:
+        return None
+
+    dp_rank = torch.distributed.get_rank(group=dp_group)
+    dp_size = torch.distributed.get_world_size(group=dp_group)
+    val_dataloader_type = "cyclic" if isinstance(dataset_config, GPTDatasetConfig) else dataset_config.dataloader_type
+
+    valid_dataloader = build_pretraining_data_loader(
+        valid_ds,
+        0,
+        val_dataloader_type,
+        eval_mbs,
+        dataset_config.num_workers,
+        dataset_config.data_sharding,
+        collate_fn=valid_ds.collate_fn if hasattr(valid_ds, "collate_fn") else None,
+        pin_memory=dataset_config.pin_memory,
+        persistent_workers=dataset_config.persistent_workers,
+        data_parallel_rank=dp_rank,
+        data_parallel_size=dp_size,
+        global_batch_size=eval_gbs,
+    )
+    return get_data_iterator(val_dataloader_type, valid_dataloader)
+
+
 def setup_data_iterators(
     cfg: ConfigContainer,
     train_state: TrainState,

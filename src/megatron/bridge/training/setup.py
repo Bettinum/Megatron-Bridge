@@ -15,6 +15,7 @@
 import inspect
 import logging
 import time
+from copy import deepcopy
 from functools import partial
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -25,6 +26,7 @@ from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.bridge.models.transformer_config import TransformerConfig
 import torch
 from megatron.core.config import set_experimental_flag
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.jit import disable_jit_fuser
@@ -34,7 +36,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer import MegatronModule
 
-from megatron.bridge.data.loaders import setup_data_iterators
+from megatron.bridge.data.loaders import build_validation_data_iterator, setup_data_iterators
+from megatron.bridge.data.utils import get_dataset_provider
 from megatron.bridge.training.callbacks import CallbackContext, CallbackManager, should_fire
 from megatron.bridge.models import GPTModelProvider, T5ModelProvider
 from megatron.bridge.training import fault_tolerance
@@ -45,7 +48,7 @@ from megatron.bridge.training.checkpointing import (
     CheckpointManager,
     create_checkpoint_manager,
 )
-from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.config import ConfigContainer, DownstreamValidationDatasetConfig, GPTDatasetConfig
 from megatron.bridge.training.initialize import initialize_megatron, set_jit_fusion_options
 from megatron.bridge.training.optim import setup_optimizer
 from megatron.bridge.training.state import GlobalState
@@ -83,6 +86,7 @@ class SetupOutput(NamedTuple):
     train_data_iterator: Optional[RerunDataIterator | list[RerunDataIterator]]
     valid_data_iterator: Optional[RerunDataIterator | list[RerunDataIterator]]
     test_data_iterator: Optional[RerunDataIterator | list[RerunDataIterator]]
+    downstream_valid_data_iterators: dict[str, Optional[RerunDataIterator | list[RerunDataIterator]]]
     checkpoint_manager: CheckpointManager
     pg_collection: ProcessGroupCollection
 
@@ -336,6 +340,11 @@ def setup(
         train_valid_test_datasets_provider=train_valid_test_datasets_provider,
         dp_group=pg_collection.dp,
     )
+    downstream_valid_data_iterators = _setup_downstream_validation_data_iterators(
+        cfg=cfg,
+        tokenizer=tokenizer,
+        pg_collection=pg_collection,
+    )
     timers("train/valid/test-data-iterators-setup").stop()
     barrier_and_log("after dataloaders are built")
 
@@ -356,6 +365,7 @@ def setup(
         train_data_iterator,
         valid_data_iterator,
         test_data_iterator,
+        downstream_valid_data_iterators,
         checkpoint_manager,
         pg_collection,
     )
@@ -392,6 +402,78 @@ def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCo
             data_parallel_random_init=cfg.rng.data_parallel_random_init,
             pg_collection=pg_collection,
         )
+
+
+def _setup_downstream_validation_data_iterators(
+    cfg: ConfigContainer,
+    tokenizer,
+    pg_collection: ProcessGroupCollection,
+) -> dict[str, Optional[RerunDataIterator | list[RerunDataIterator]]]:
+    """Build validation-only iterators for configured downstream datasets."""
+    downstream_iterators: dict[str, Optional[RerunDataIterator | list[RerunDataIterator]]] = {}
+    if not cfg.validation.downstream_validation_datasets:
+        return downstream_iterators
+
+    for validation_dataset in cfg.validation.downstream_validation_datasets:
+        dataset_config = _resolve_downstream_validation_dataset_config(cfg, validation_dataset)
+        if hasattr(dataset_config, "tokenizer"):
+            dataset_config.tokenizer = tokenizer
+
+        dataset_provider = get_dataset_provider(dataset_config)
+        if "tokenizer" in inspect.signature(dataset_provider).parameters:
+            dataset_provider = partial(dataset_provider, tokenizer=tokenizer)
+        if "pg_collection" in inspect.signature(dataset_provider).parameters:
+            dataset_provider = partial(dataset_provider, pg_collection=pg_collection)
+
+        print_rank_0(f"> building downstream validation dataset '{validation_dataset.name}' ...")
+        downstream_iterators[validation_dataset.name] = build_validation_data_iterator(
+            cfg=cfg,
+            dataset_config=dataset_config,
+            build_train_valid_test_datasets_provider=dataset_provider,
+            dp_group=pg_collection.dp,
+            eval_iters=validation_dataset.eval_iters,
+        )
+        print_rank_0(f"> finished downstream validation dataset '{validation_dataset.name}' ...")
+
+    return downstream_iterators
+
+
+def _resolve_downstream_validation_dataset_config(
+    cfg: ConfigContainer,
+    validation_dataset: DownstreamValidationDatasetConfig,
+):
+    """Resolve a downstream validation dataset to a concrete dataset config."""
+    if validation_dataset.dataset is not None:
+        return validation_dataset.dataset
+
+    if not isinstance(cfg.dataset, GPTDatasetConfig):
+        raise ValueError(
+            f"Downstream validation dataset '{validation_dataset.name}' uses data_path/data_args_path, "
+            "which is only supported when the main dataset is GPTDatasetConfig. "
+            "Pass a complete DatasetProvider via the dataset field for other dataset types."
+        )
+
+    if validation_dataset.data_args_path is not None:
+        with open(validation_dataset.data_args_path, "r") as f:
+            data_path = f.read().split()
+    elif isinstance(validation_dataset.data_path, str):
+        data_path = validation_dataset.data_path.split()
+    else:
+        data_path = list(validation_dataset.data_path or [])
+
+    if not data_path:
+        raise ValueError(f"Downstream validation dataset '{validation_dataset.name}' has an empty data_path.")
+
+    dataset_config = deepcopy(cfg.dataset)
+    dataset_config.blend = None
+    dataset_config.data_path = None
+    dataset_config.blend_per_split = [None, get_blend_from_list(data_path), None]
+    dataset_config.split = None
+    if hasattr(dataset_config, "mock"):
+        dataset_config.mock = False
+    if hasattr(dataset_config, "finalize"):
+        dataset_config.finalize()
+    return dataset_config
 
 
 def _update_model_config_funcs(

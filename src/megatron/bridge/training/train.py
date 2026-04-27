@@ -70,7 +70,7 @@ from megatron.bridge.training.checkpointing import (
     CheckpointSaveContext,
 )
 from megatron.bridge.training.config import ConfigContainer
-from megatron.bridge.training.eval import evaluate_and_print_results
+from megatron.bridge.training.eval import evaluate_and_print_results, evaluate_downstream_validation_tasks
 from megatron.bridge.training.forward_step_func_types import ForwardStepCallable
 from megatron.bridge.training.initialize import destroy_global_state
 from megatron.bridge.training.nvrx_straggler import (
@@ -119,6 +119,9 @@ def train(
     global_state: GlobalState,
     checkpoint_manager: CheckpointManager,
     pg_collection: ProcessGroupCollection,
+    downstream_valid_data_iterators: Optional[
+        dict[str, Optional[Union[RerunDataIterator, list[RerunDataIterator]]]]
+    ] = None,
     process_non_loss_data_func: Optional[Callable] = None,
     non_loss_data_func: Optional[Callable] = None,
     callback_manager: CallbackManager | None = None,
@@ -137,6 +140,7 @@ def train(
         valid_data_iterator: Iterator for the validation dataset.
         global_state: The GlobalState object holding various training states.
         checkpoint_manager: The checkpoint manager for save/load operations.
+        downstream_valid_data_iterators: Optional validation-only iterators keyed by task name.
         process_non_loss_data_func: Optional function to process non-loss data during evaluation.
         non_loss_data_func: Optional function to compute non-loss data during evaluation.
         callback_manager: Optional CallbackManager for custom callback execution.
@@ -582,8 +586,9 @@ def train(
                 loaded_iteration=start_iteration,
             )
 
+        has_downstream_validation = bool(downstream_valid_data_iterators)
         if (
-            global_state.train_state.do_valid
+            (global_state.train_state.do_valid or has_downstream_validation)
             and val_config.eval_interval
             and (
                 val_config.start_eval_at_iter is None or global_state.train_state.step >= val_config.start_eval_at_iter
@@ -601,19 +606,34 @@ def train(
                 gc.collect()
             prefix = f"iteration {global_state.train_state.step}"
             timers("eval-time", log_level=0).start(barrier=True)
-            evaluate_and_print_results(
-                global_state,
-                prefix,
-                forward_step_func,
-                valid_data_iterator,
-                model,
-                model_config,
-                verbose=False,
-                write_to_tensorboard=True,
-                process_non_loss_data_func=process_non_loss_data_func,
-                non_loss_data_func=non_loss_data_func,
-                callback_manager=callback_manager,
-            )
+            if global_state.train_state.do_valid:
+                evaluate_and_print_results(
+                    global_state,
+                    prefix,
+                    forward_step_func,
+                    valid_data_iterator,
+                    model,
+                    model_config,
+                    verbose=False,
+                    write_to_tensorboard=True,
+                    process_non_loss_data_func=process_non_loss_data_func,
+                    non_loss_data_func=non_loss_data_func,
+                    callback_manager=callback_manager,
+                )
+            if downstream_valid_data_iterators:
+                evaluate_downstream_validation_tasks(
+                    state=global_state,
+                    prefix=prefix,
+                    forward_step_func=forward_step_func,
+                    downstream_data_iterators=downstream_valid_data_iterators,
+                    model=model,
+                    config=model_config,
+                    verbose=False,
+                    write_to_tensorboard=True,
+                    process_non_loss_data_func=process_non_loss_data_func,
+                    non_loss_data_func=non_loss_data_func,
+                    callback_manager=callback_manager,
+                )
             timers("eval-time").stop()
 
             if train_config.manual_gc and train_config.manual_gc_eval:

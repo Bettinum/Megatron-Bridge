@@ -133,6 +133,9 @@ def _pretrain(
     train_data_iterator = setup_output.train_data_iterator
     valid_data_iterator = setup_output.valid_data_iterator
     test_data_iterator = setup_output.test_data_iterator
+    downstream_valid_data_iterators = getattr(setup_output, "downstream_valid_data_iterators", {}) or {}
+    if not isinstance(downstream_valid_data_iterators, dict):
+        downstream_valid_data_iterators = {}
     checkpoint_manager = setup_output.checkpoint_manager
     pg_collection = setup_output.pg_collection
 
@@ -149,6 +152,7 @@ def _pretrain(
                 state,
                 checkpoint_manager,
                 pg_collection,
+                downstream_valid_data_iterators=downstream_valid_data_iterators,
                 callback_manager=callback_manager,
             )
 
@@ -169,6 +173,20 @@ def _pretrain(
             valid_data_iterator,
             model,
             config.model,
+            verbose=True,
+            write_to_tensorboard=not config.validation.skip_train,
+            callback_manager=callback_manager,
+        )
+    if downstream_valid_data_iterators:
+        from megatron.bridge.training.eval import evaluate_downstream_validation_tasks
+
+        evaluate_downstream_validation_tasks(
+            state=state,
+            prefix=f"iteration {iteration}",
+            forward_step_func=forward_step_func,
+            downstream_data_iterators=downstream_valid_data_iterators,
+            model=model,
+            config=config.model,
             verbose=True,
             write_to_tensorboard=not config.validation.skip_train,
             callback_manager=callback_manager,
